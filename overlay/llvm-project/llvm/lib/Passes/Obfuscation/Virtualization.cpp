@@ -2,13 +2,6 @@
 // Translates IR functions into custom bytecode + software interpreter.
 // Ported from Hikari-fix (PPKunOfficial), adapted for LLVM 17 new PM,
 // Android NDK targets, and stripped of Darwin/ObjC dependencies.
-//
-// Architecture:
-//   translateFunction()  → encodes IR into VMPContext.Code (byte buffer)
-//   encryptBytecode()    → dual-layer xorshift32 XOR per basic block
-//   buildInterpreter()   → replaces function body with dispatch loop
-//   buildCallHandler()   → separate switch function for call sites
-//   buildEvalFn()        → operand reader helper (inline in interpreter)
 
 #include "Obfuscation/Virtualization.h"
 #include "Obfuscation/Utils.h"
@@ -61,25 +54,19 @@ enum VmCast : uint8_t {
   CAST_BITCAST=3, CAST_PTRTOINT=4, CAST_INTTOPTR=5
 };
 
-static constexpr unsigned kPtrSize = 8; // all targets are 64-bit Android
+static constexpr unsigned kPtrSize = 8;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Per-BB encryption metadata
-// ─────────────────────────────────────────────────────────────────────────────
 struct BBSeedInfo {
   uint32_t EntryIP = 0, EndIP = 0;
   uint32_t OpcodeSeed = 0, CodeSeed = 0;
-  std::vector<uint32_t> OpcodeOffsets; // code[] offsets that hold opcodes
+  std::vector<uint32_t> OpcodeOffsets;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Call site descriptor (deferred — emitted as OP_CALL <id>)
-// ─────────────────────────────────────────────────────────────────────────────
 struct CallArgInfo {
   bool     IsConst  = false;
   uint64_t ConstVal = 0;
-  uint32_t Off      = 0;   // data-area slot
-  uint32_t Size     = 8;   // bytes
+  uint32_t Off      = 0;
+  uint32_t Size     = 8;
 };
 struct CallSiteInfo {
   uint32_t             Id         = 0;
@@ -91,16 +78,13 @@ struct CallSiteInfo {
   std::vector<CallArgInfo> Args;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Translation context (one per function being virtualized)
-// ─────────────────────────────────────────────────────────────────────────────
 struct VMPContext {
   std::vector<uint8_t>          Code;
-  std::map<Value *, uint32_t>   ValueMap;    // Value → data-area byte offset
-  std::map<BasicBlock *, uint32_t> BBMap;    // BB → code IP
-  std::vector<std::pair<uint32_t, BasicBlock *>> BrPatches; // (codeOff, target)
+  std::map<Value *, uint32_t>   ValueMap;
+  std::map<BasicBlock *, uint32_t> BBMap;
+  std::vector<std::pair<uint32_t, BasicBlock *>> BrPatches;
   std::vector<CallSiteInfo>     Calls;
-  std::vector<std::pair<GlobalValue *, uint32_t>> Globals;  // GV → data slot
+  std::vector<std::pair<GlobalValue *, uint32_t>> Globals;
   uint32_t DataSize = 0;
   std::vector<BBSeedInfo> BBInfos;
   bool Failed = false;
@@ -118,14 +102,11 @@ struct VMPContext {
   uint32_t ip() const { return (uint32_t)Code.size(); }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers: type size, opcode mappers
-// ─────────────────────────────────────────────────────────────────────────────
 static uint32_t typeSize(Type *T) {
   if (T->isVoidTy())    return 0;
   if (T->isPointerTy()) return kPtrSize;
   if (T->isIntegerTy()) return (T->getIntegerBitWidth() + 7) / 8;
-  return 0; // unsupported
+  return 0;
 }
 
 static bool isTypeOK(Type *T) {
@@ -171,18 +152,14 @@ static uint8_t mapCast(unsigned Op) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Operand encoding:
-//   [size:u8][type:u8=0(var)/1(const)][8 bytes = slot-offset or const-value]
-// ─────────────────────────────────────────────────────────────────────────────
 static void emitVar(VMPContext &C, uint32_t slot, uint32_t sz) {
   C.emitU8((uint8_t)sz);
-  C.emitU8(0); // variable
+  C.emitU8(0);
   C.emitU64(slot);
 }
 static void emitConst(VMPContext &C, uint64_t val, uint32_t sz) {
   C.emitU8((uint8_t)sz);
-  C.emitU8(1); // constant
+  C.emitU8(1);
   C.emitU64(val);
 }
 
@@ -199,10 +176,7 @@ static void emitOperand(VMPContext &C, Value *V) {
     return;
   }
   if (GlobalValue *GV = dyn_cast<GlobalValue>(V)) {
-    // Emit pointer to global as a constant (address taken at runtime)
     uint32_t sz = kPtrSize;
-    // We use a sentinel 0 and patch at interpreter startup — simplify by
-    // storing GV pointer as a per-module global slot in data area
     for (auto &G : C.Globals)
       if (G.first == GV) { emitVar(C, G.second, sz); return; }
     uint32_t slot = C.allocSlot(sz);
@@ -215,13 +189,9 @@ static void emitOperand(VMPContext &C, Value *V) {
     emitVar(C, it->second, typeSize(V->getType()) ? typeSize(V->getType()) : 1);
     return;
   }
-  // Undef or unsupported — emit zero constant
   emitConst(C, 0, typeSize(V->getType()) ? typeSize(V->getType()) : 1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// xorshift32 — same algorithm as Hikari for compatibility
-// ─────────────────────────────────────────────────────────────────────────────
 static uint32_t xorshift32(uint32_t &state) {
   state ^= state << 13;
   state ^= state >> 17;
@@ -229,18 +199,13 @@ static uint32_t xorshift32(uint32_t &state) {
   return state;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Translate one instruction into bytecode
-// ─────────────────────────────────────────────────────────────────────────────
 static void translateInst(VMPContext &C, Instruction &I) {
-  // Record where this opcode byte lands (for encryption)
   uint32_t opcodeOff = C.ip();
 
   if (isa<PHINode>(I)) {
-    C.Failed = true; C.FailReason = "phi node (run mem2reg first)"; return;
+    C.Failed = true; C.FailReason = "phi node found (fixStack should eliminate)"; return;
   }
   if (isa<IntrinsicInst>(I)) {
-    // Quietly skip non-critical intrinsics (lifetime, debug)
     if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
       Intrinsic::ID id = II->getIntrinsicID();
       if (id == Intrinsic::lifetime_start || id == Intrinsic::lifetime_end ||
@@ -257,14 +222,13 @@ static void translateInst(VMPContext &C, Instruction &I) {
     uint32_t sz = typeSize(AI->getAllocatedType());
     if (sz == 0) sz = kPtrSize;
     uint32_t slot = C.allocSlot(sz);
-    // The alloca result is a pointer — allocate a pointer slot too
     uint32_t ptrSlot = C.allocSlot(kPtrSize);
     C.ValueMap[AI] = ptrSlot;
     C.emitU8(OP_ALLOCA);
     C.BBInfos.back().OpcodeOffsets.push_back(opcodeOff);
-    C.emitU64(slot);   // data area offset of the alloca'd memory
-    C.emitU64(sz);     // size
-    C.emitU64(ptrSlot);// where to store the pointer result
+    C.emitU64(slot);
+    C.emitU64(sz);
+    C.emitU64(ptrSlot);
     return;
   }
   if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -309,7 +273,7 @@ static void translateInst(VMPContext &C, Instruction &I) {
   if (auto *CI = dyn_cast<ICmpInst>(&I)) {
     uint8_t pred = mapCmp(CI->getPredicate());
     if (pred == 0xFF) { C.Failed=true; C.FailReason="icmp pred"; return; }
-    uint32_t dst = C.allocSlot(1); // i1 result stored as 1 byte
+    uint32_t dst = C.allocSlot(1);
     C.ValueMap[CI] = dst;
     C.emitU8(OP_ICMP);
     C.BBInfos.back().OpcodeOffsets.push_back(opcodeOff);
@@ -323,15 +287,15 @@ static void translateInst(VMPContext &C, Instruction &I) {
     C.emitU8(OP_BR);
     C.BBInfos.back().OpcodeOffsets.push_back(opcodeOff);
     if (BI->isUnconditional()) {
-      C.emitU8(0); // unconditional
+      C.emitU8(0);
       uint32_t patchOff = C.ip();
-      C.emitU64(0); // placeholder target IP
+      C.emitU64(0);
       C.BrPatches.push_back({patchOff, BI->getSuccessor(0)});
     } else {
-      C.emitU8(1); // conditional
+      C.emitU8(1);
       emitOperand(C, BI->getCondition());
-      uint32_t p0 = C.ip(); C.emitU64(0); // true target
-      uint32_t p1 = C.ip(); C.emitU64(0); // false target
+      uint32_t p0 = C.ip(); C.emitU64(0);
+      uint32_t p1 = C.ip(); C.emitU64(0);
       C.BrPatches.push_back({p0, BI->getSuccessor(0)});
       C.BrPatches.push_back({p1, BI->getSuccessor(1)});
     }
@@ -341,7 +305,7 @@ static void translateInst(VMPContext &C, Instruction &I) {
     C.emitU8(OP_RET);
     C.BBInfos.back().OpcodeOffsets.push_back(opcodeOff);
     if (RI->getNumOperands() == 0) {
-      C.emitU8(0); // void
+      C.emitU8(0);
     } else {
       C.emitU8(1);
       emitOperand(C, RI->getReturnValue());
@@ -385,8 +349,7 @@ static void translateInst(VMPContext &C, Instruction &I) {
     C.emitU8(OP_GEP);
     C.BBInfos.back().OpcodeOffsets.push_back(opcodeOff);
     C.emitU64(dst);
-    emitOperand(C, GEP->getPointerOperand()); // base ptr
-    // Emit flat byte offset — sum all constant indices (simplified)
+    emitOperand(C, GEP->getPointerOperand());
     APInt ConstOffset(64, 0);
     if (GEP->hasAllConstantIndices() &&
         GEP->accumulateConstantOffset(GEP->getModule()->getDataLayout(),
@@ -451,12 +414,8 @@ static void translateInst(VMPContext &C, Instruction &I) {
   C.FailReason = std::string("unsupported: ") + I.getOpcodeName();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Translate entire function: alloc data slots, translate all insns,
-// back-patch branch targets, encrypt bytecode.
-// ─────────────────────────────────────────────────────────────────────────────
 static void translateFunction(VMPContext &C, Function &F) {
-  // Allocate data slots for arguments (pass by value into data area).
+  // Alloc data slots for args
   for (Argument &Arg : F.args()) {
     uint32_t sz = typeSize(Arg.getType());
     if (!sz) sz = kPtrSize;
@@ -464,17 +423,15 @@ static void translateFunction(VMPContext &C, Function &F) {
     C.ValueMap[&Arg] = slot;
   }
 
-  // Allocate return value slot.
+  // Alloc return slot
   uint32_t retSz = typeSize(F.getReturnType());
   if (retSz == 0 && !F.getReturnType()->isVoidTy()) retSz = kPtrSize;
   uint32_t retSlot = retSz ? C.allocSlot(retSz) : 0;
 
-  // Collect basic blocks and record their code IPs.
   std::vector<BasicBlock *> BBs;
   for (BasicBlock &BB : F)
     BBs.push_back(&BB);
 
-  // Translate all instructions per BB.
   for (BasicBlock *BB : BBs) {
     C.BBMap[BB] = C.ip();
     BBSeedInfo BBI;
@@ -485,7 +442,6 @@ static void translateFunction(VMPContext &C, Function &F) {
         translateInst(C, I);
       if (C.Failed) return;
     }
-    // Emit terminator.
     Instruction *Term = BB->getTerminator();
     if (Term) translateInst(C, *Term);
     if (C.Failed) return;
@@ -494,27 +450,25 @@ static void translateFunction(VMPContext &C, Function &F) {
     C.BBInfos.push_back(BBI);
   }
 
-  // Back-patch branch targets.
+  // Back-patch branch targets
   for (auto &[codeOff, targetBB] : C.BrPatches) {
     uint32_t targetIP = C.BBMap[targetBB];
     for (int i = 0; i < 8; i++)
       C.Code[codeOff + i] = (targetIP >> (i * 8)) & 0xFF;
   }
 
-  // Encrypt bytecode per BB.
+  // Encrypt
   for (size_t i = 0; i < C.BBInfos.size(); i++) {
     BBSeedInfo &BBI = C.BBInfos[i];
     BBI.OpcodeSeed = 0x12345678 ^ (i * 0xDEADBEEF);
     BBI.CodeSeed   = 0x87654321 ^ (i * 0xCAFEBABE);
 
-    // Opcode layer: XOR only opcode bytes.
     uint32_t os = BBI.OpcodeSeed;
     for (uint32_t off : BBI.OpcodeOffsets) {
       xorshift32(os);
       C.Code[off] ^= (os & 0xFF);
     }
 
-    // Code layer: XOR every byte in the BB range.
     uint32_t cs = BBI.CodeSeed;
     for (uint32_t j = BBI.EntryIP; j < BBI.EndIP; j++) {
       xorshift32(cs);
@@ -523,9 +477,6 @@ static void translateFunction(VMPContext &C, Function &F) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main entry point
-// ─────────────────────────────────────────────────────────────────────────────
 PreservedAnalyses Virtualization::run(Module &M, ModuleAnalysisManager &AM) {
   bool Changed = false;
 
@@ -536,18 +487,20 @@ PreservedAnalyses Virtualization::run(Module &M, ModuleAnalysisManager &AM) {
         getFunctionAnnotation(&F).find("vmp") == std::string::npos)
       continue;
 
+    // CRITICAL: demote PHIs to stack before translation
+    fixStack(F);
+
     VMPContext C;
     translateFunction(C, F);
 
     if (C.Failed) {
-      // Quietly skip this function — VMP is best-effort.
+      // Skip this function — VMP is best-effort
       continue;
     }
 
-    // For now, just mark as processed. Full interpreter building
-    // (buildInterpreter) would be implemented here — it's complex and
-    // beyond this scope. The bytecode is ready in C.Code, encrypted,
-    // with call descriptors in C.Calls.
+    // Skeleton complete: bytecode is encrypted in C.Code, with seeds in C.BBInfos.
+    // Full interpreter building (buildInterpreter + buildCallHandler) would go here.
+    // For now, mark as processed.
     Changed = true;
   }
 
