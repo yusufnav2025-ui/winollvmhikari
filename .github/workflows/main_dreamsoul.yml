@@ -16,8 +16,10 @@
 #   -mllvm -funcwrap  (Function Wrapper — hides call targets)
 #   -mllvm -constenc  (Constant Encryption — XOR-encrypts integer constants)
 #   -mllvm -fco       (Function Call Obfuscation — dlopen/dlsym indirection for external calls)
+#   -mllvm -antihook  (Anti-Hooking — AArch64 inline hook detection + anti-rebind)
+#   -mllvm -vmp       (Virtualization — translates functions to bytecode + interpreter)
 #   -mllvm -aarch64-obfu (AArch64 backend obfuscation -- requires asm("backend-obfu") marker)
-#   Full: __attribute__((annotate("fla bcf sub mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco")))
+#   Full: __attribute__((annotate("fla bcf sub mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco antihook vmp")))
 # ====================================================================
 name: Build OLLVM17 (Windows, for Android NDK r26)
 
@@ -250,7 +252,7 @@ jobs:
       # 6c. Patch PassBuilder.cpp: add ALL pass includes, CLI flags
       #     and pass registrations (LinearMBA, AliasAccess, JunkCodeGen,
       #     BogusControlFlow2, MergeFunction, AntiDebugging, FunctionWrapper,
-      #     ConstantEncryption, FunctionCallObfuscate).
+      #     ConstantEncryption, FunctionCallObfuscate, AntiHooking, Virtualization).
       # ---------------------------------------------------------------
       - name: Patch PassBuilder.cpp (all IR passes)
         shell: bash
@@ -269,7 +271,7 @@ jobs:
           text = p.read_text(encoding="utf-8", errors="replace")
 
           # Idempotency: if the last new include is already present, skip.
-          if 'Obfuscation/FunctionCallObfuscate.h' in text:
+          if 'Obfuscation/Virtualization.h' in text:
               print("PassBuilder already fully patched -- skipping")
               sys.exit(0)
 
@@ -292,7 +294,9 @@ jobs:
               + '\n#include "Obfuscation/AntiDebugging.h" // Anti-debugging'
               + '\n#include "Obfuscation/FunctionWrapper.h" // Function wrapper'
               + '\n#include "Obfuscation/ConstantEncryption.h" // Constant encryption'
-              + '\n#include "Obfuscation/FunctionCallObfuscate.h" // Function call obfuscation')
+              + '\n#include "Obfuscation/FunctionCallObfuscate.h" // Function call obfuscation'
+              + '\n#include "Obfuscation/AntiHooking.h" // Anti-hooking'
+              + '\n#include "Obfuscation/Virtualization.h" // Virtualization')
           text = must_replace(text, inc_marker, inc_new, "include-line")
 
           # 2. Add cl::opt flags after s_obf_fn_name_cmd
@@ -306,7 +310,9 @@ jobs:
               + '\nstatic cl::opt<bool> s_obf_antidbg("antidbg", cl::init(false), cl::desc("Anti-Debugging (blocks Frida/IDA attach)"));'
               + '\nstatic cl::opt<bool> s_obf_funcwrap("funcwrap", cl::init(false), cl::desc("Function Wrapper (hides call targets)"));'
               + '\nstatic cl::opt<bool> s_obf_constenc("constenc", cl::init(false), cl::desc("Constant Encryption (XOR-encrypts integer constants)"));'
-              + '\nstatic cl::opt<bool> s_obf_fco("fco", cl::init(false), cl::desc("Function Call Obfuscation (dlopen/dlsym indirection)"));')
+              + '\nstatic cl::opt<bool> s_obf_fco("fco", cl::init(false), cl::desc("Function Call Obfuscation (dlopen/dlsym indirection)"));'
+              + '\nstatic cl::opt<bool> s_obf_antihook("antihook", cl::init(false), cl::desc("Anti-Hooking (AArch64 hook detection + rebind protection)"));'
+              + '\nstatic cl::opt<bool> s_obf_vmp("vmp", cl::init(false), cl::desc("Virtualization (function bytecode + interpreter)"));')
           text = must_replace(text, opt_marker, opt_new, "cl::opt flags")
 
           # 3. Add Function passes in FPM (after BCF)
@@ -319,16 +325,14 @@ jobs:
           text = must_replace(text, bcf_marker, bcf_new, "FPM registration")
 
           # 4. Add Module passes (before RewriteSymbolPass)
-          # Order: AliasAccess -> MergeFunction -> FunctionWrapper ->
-          #        FunctionCallObfuscate -> ConstantEncryption -> RewriteSymbol
-          # ConstantEncryption runs last so it also encrypts constants introduced
-          # by FunctionCallObfuscate (e.g. dlopen flag values).
           rs_marker = 'MPM.addPass(RewriteSymbolPass()); // 根据yaml信息 重命名特定symbols'
           rs_new = ('MPM.addPass(polaris::AliasAccess(s_obf_alias)); // Alias access obfuscation'
               + '\n        MPM.addPass(MergeFunction(s_obf_mergefunc)); // Merge functions'
               + '\n        MPM.addPass(FunctionWrapper(s_obf_funcwrap)); // Function wrapper'
               + '\n        MPM.addPass(FunctionCallObfuscate(s_obf_fco)); // Call obfuscation via dlopen/dlsym'
               + '\n        MPM.addPass(ConstantEncryption(s_obf_constenc)); // XOR-encrypt integer constants'
+              + '\n        MPM.addPass(AntiHooking(s_obf_antihook)); // Anti-hook detection and rebind protection'
+              + '\n        MPM.addPass(Virtualization(s_obf_vmp)); // Function virtualization'
               + '\n        MPM.addPass(RewriteSymbolPass()); // 根据yaml信息 重命名特定symbols')
           text = must_replace(text, rs_marker, rs_new, "MPM registration")
 
@@ -342,6 +346,8 @@ jobs:
           grep -c "Obfuscation/AntiDebugging.h"         "$PB" || true
           grep -c "Obfuscation/ConstantEncryption.h"    "$PB" || true
           grep -c "Obfuscation/FunctionCallObfuscate.h" "$PB" || true
+          grep -c "Obfuscation/AntiHooking.h"           "$PB" || true
+          grep -c "Obfuscation/Virtualization.h"        "$PB" || true
 
       # ---------------------------------------------------------------
       # 6d. Patch AArch64 CMakeLists.txt: add AArch64RubbishCode.cpp
@@ -586,22 +592,15 @@ jobs:
   #        -mllvm -mba -mllvm -alias -mllvm -junkcode -mllvm -bcf2 -mllvm -mergefunc
   #        -mllvm -constenc   (XOR-encrypt integer constants)
   #        -mllvm -fco        (replace external calls with dlopen/dlsym at runtime)
+  #        -mllvm -antihook   (detect AArch64 inline hooks, prevent symbol rebinding)
+  #        -mllvm -vmp        (virtualize functions into bytecode + interpreter)
   #        -mllvm -aarch64-obfu
   #   4. For per-function control use annotation:
-  #        __attribute__((annotate("fla bcf sub split mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco"))) void f(){...}
+  #        __attribute__((annotate("fla bcf sub split mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco antihook vmp"))) void f(){...}
   #   5. For AArch64 backend obfuscation, add asm("backend-obfu") in the function body
   #
-  # NOTE on -fco (FunctionCallObfuscate):
-  #   Replaces direct calls to external (non-local) functions with runtime
-  #   dlopen(NULL)/dlsym() resolution so call targets are invisible to static
-  #   analysis tools. Safe to combine with all other flags. Skips C++ ABI
-  #   helpers (__cxa_*), stack-protector, intrinsics, and vararg functions.
-  #   Requires the target library symbols to be exported at runtime (standard
-  #   NDK libc/libm/liblog symbols are always safe).
-  #
-  # NOTE on -constenc (ConstantEncryption):
-  #   Replaces each ConstantInt operand (i8/i16/i32/i64) with a runtime XOR
-  #   decryption sequence so raw values like magic numbers, offsets, and keys
-  #   never appear in the binary in plaintext. Skips switch case labels, phi
-  #   nodes, GEP indices, atomic operands, and trivial constants (0 and 1).
+  # Supported flags (complete list):
+  #   DreamSoule base:  -fla, -bcf, -sobf, -icall, -ibr, -igv, -sub, -split, -fncmd
+  #   Polaris overlay:  -mba, -alias, -junkcode, -bcf2, -mergefunc, -antidbg, -funcwrap, -aarch64-obfu
+  #   Hikari ports:     -constenc, -fco, -antihook, -vmp
   # -----------------------------------------------------------------
