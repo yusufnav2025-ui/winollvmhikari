@@ -75,8 +75,8 @@ PreservedAnalyses ConstantEncryption::run(Module &M, ModuleAnalysisManager &AM) 
       APInt Key(W, RNG());          // random key, same width
       APInt Enc = CI->getValue() ^ Key; // encrypted value
 
-      ConstantInt *EncC = ConstantInt::get(Ty, Enc);
-      ConstantInt *KeyC = ConstantInt::get(Ty, Key);
+      ConstantInt *EncC = cast<ConstantInt>(ConstantInt::get(Ty, Enc));
+      ConstantInt *KeyC = cast<ConstantInt>(ConstantInt::get(Ty, Key));
 
       // Insert XOR just before the using instruction so the decrypted value
       // is available exactly when the instruction needs it.

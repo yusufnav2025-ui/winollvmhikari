@@ -113,11 +113,12 @@ PreservedAnalyses AntiHooking::run(Module &M, ModuleAnalysisManager &AM) {
 
     for (CallBase *CB : ToRedirect) {
       Function *Called = cast<Function>(CB->getCalledOperand()->stripPointerCasts());
-      GlobalVariable *GV = M.getGlobalVariable("AntiRebindSymbol_" + Called->getName());
+      std::string SymbolName = (Twine("AntiRebindSymbol_") + Called->getName()).str();
+      GlobalVariable *GV = M.getGlobalVariable(StringRef(SymbolName));
       if (!GV) {
         GV = new GlobalVariable(M, Called->getType(), false,
                                 GlobalValue::PrivateLinkage, Called,
-                                "AntiRebindSymbol_" + Called->getName());
+                                SymbolName);
         GV->setConstant(true);
         appendToCompilerUsed(M, {GV});
       }
