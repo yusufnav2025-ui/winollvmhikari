@@ -18,6 +18,8 @@
 #   -mllvm -fco       (Function Call Obfuscation — dlopen/dlsym indirection for external calls)
 #   -mllvm -antihook  (Anti-Hooking — AArch64 inline hook detection + anti-rebind)
 #   -mllvm -vmp       (Virtualization — translates functions to bytecode + interpreter)
+#   -mllvm -expiry=1440  (Time expiry — kill app after N minutes from build; 0=off)
+#   -mllvm -expiry-print=0 (suppress the expiry message in release builds)
 #   -mllvm -aarch64-obfu (AArch64 backend obfuscation -- requires asm("backend-obfu") marker)
 #   Full: __attribute__((annotate("fla bcf sub mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco antihook vmp")))
 # ====================================================================
@@ -271,7 +273,7 @@ jobs:
           text = p.read_text(encoding="utf-8", errors="replace")
 
           # Idempotency: if the last new include is already present, skip.
-          if 'Obfuscation/Virtualization.h' in text:
+          if 'Obfuscation/TimeExpiry.h' in text:
               print("PassBuilder already fully patched -- skipping")
               sys.exit(0)
 
@@ -296,7 +298,8 @@ jobs:
               + '\n#include "Obfuscation/ConstantEncryption.h" // Constant encryption'
               + '\n#include "Obfuscation/FunctionCallObfuscate.h" // Function call obfuscation'
               + '\n#include "Obfuscation/AntiHooking.h" // Anti-hooking'
-              + '\n#include "Obfuscation/Virtualization.h" // Virtualization')
+              + '\n#include "Obfuscation/Virtualization.h" // Virtualization'
+              + '\n#include "Obfuscation/TimeExpiry.h" // Time expiry check')
           text = must_replace(text, inc_marker, inc_new, "include-line")
 
           # 2. Add cl::opt flags after s_obf_fn_name_cmd
@@ -312,7 +315,9 @@ jobs:
               + '\nstatic cl::opt<bool> s_obf_constenc("constenc", cl::init(false), cl::desc("Constant Encryption (XOR-encrypts integer constants)"));'
               + '\nstatic cl::opt<bool> s_obf_fco("fco", cl::init(false), cl::desc("Function Call Obfuscation (dlopen/dlsym indirection)"));'
               + '\nstatic cl::opt<bool> s_obf_antihook("antihook", cl::init(false), cl::desc("Anti-Hooking (AArch64 hook detection + rebind protection)"));'
-              + '\nstatic cl::opt<bool> s_obf_vmp("vmp", cl::init(false), cl::desc("Virtualization (function bytecode + interpreter)"));')
+              + '\nstatic cl::opt<bool> s_obf_vmp("vmp", cl::init(false), cl::desc("Virtualization (function bytecode + interpreter)"));'
+              + '\nstatic cl::opt<unsigned> s_obf_expiry("expiry", cl::init(0), cl::desc("Time expiry in minutes from build (0=disabled)"));'
+              + '\nstatic cl::opt<bool> s_obf_expiry_print("expiry-print", cl::init(true), cl::desc("Print expiry message (0 to disable in release)"));')
           text = must_replace(text, opt_marker, opt_new, "cl::opt flags")
 
           # 3. Add Function passes in FPM (after BCF)
@@ -336,6 +341,14 @@ jobs:
               + '\n        MPM.addPass(RewriteSymbolPass()); // 根据yaml信息 重命名特定symbols')
           text = must_replace(text, rs_marker, rs_new, "MPM registration")
 
+          # 5. Add TimeExpiry FIRST in the pipeline (before StringEncryption)
+          #    so the guard is created before all obfuscation passes run and
+          #    gets auto-protected via its llvm.global.annotations entry.
+          se_marker = 'MPM.addPass(StringEncryptionPass(s_obf_sobf));'
+          se_new = ('MPM.addPass(TimeExpiry(s_obf_expiry, s_obf_expiry_print)); // 到期时间检查（先运行）'
+              + '\n        ' + se_marker)
+          text = must_replace(text, se_marker, se_new, "TimeExpiry registration")
+
           p.write_text(text, encoding="utf-8")
           print("Patched PassBuilder.cpp with all obfuscation passes")
           PYEOF
@@ -348,6 +361,7 @@ jobs:
           grep -c "Obfuscation/FunctionCallObfuscate.h" "$PB" || true
           grep -c "Obfuscation/AntiHooking.h"           "$PB" || true
           grep -c "Obfuscation/Virtualization.h"        "$PB" || true
+          grep -c "Obfuscation/TimeExpiry.h"            "$PB" || true
 
       # ---------------------------------------------------------------
       # 6d. Patch AArch64 CMakeLists.txt: add AArch64RubbishCode.cpp
@@ -593,9 +607,11 @@ jobs:
   #        -mllvm -mba -mllvm -alias -mllvm -junkcode -mllvm -bcf2 -mllvm -mergefunc
   #        -mllvm -constenc   (XOR-encrypt integer constants)
   #        -mllvm -fco        (replace external calls with dlopen/dlsym at runtime)
-  #        -mllvm -antihook   (detect AArch64 inline hooks, prevent symbol rebinding)
-  #        -mllvm -vmp        (virtualize functions into bytecode + interpreter)
-  #        -mllvm -aarch64-obfu
+#        -mllvm -antihook   (detect AArch64 inline hooks, prevent symbol rebinding)
+#        -mllvm -vmp        (virtualize functions into bytecode + interpreter)
+#        -mllvm -expiry=1440   (kill app after 1440 minutes = 1 day from build)
+#        -mllvm -expiry-print=0 (silent expiry -- no message, just crash)
+#        -mllvm -aarch64-obfu
   #   4. For per-function control use annotation:
   #        __attribute__((annotate("fla bcf sub split mba linearmba aliasaccess junkcode boguscfg2 mergefunction antidbg funcwrap constenc fco antihook vmp"))) void f(){...}
   #   5. For AArch64 backend obfuscation, add asm("backend-obfu") in the function body
@@ -603,5 +619,6 @@ jobs:
   # Supported flags (complete list):
   #   DreamSoule base:  -fla, -bcf, -sobf, -icall, -ibr, -igv, -sub, -split, -fncmd
   #   Polaris overlay:  -mba, -alias, -junkcode, -bcf2, -mergefunc, -antidbg, -funcwrap, -aarch64-obfu
-  #   Hikari ports:     -constenc, -fco, -antihook, -vmp
-  # -----------------------------------------------------------------
+#   Hikari ports:     -constenc, -fco, -antihook, -vmp
+#   TimeExpiry:       -expiry=<minutes>, -expiry-print
+# -----------------------------------------------------------------

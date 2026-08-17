@@ -30,6 +30,7 @@ add_llvm_component_library(LLVMPasses
   Obfuscation/FunctionCallObfuscate.cpp
   Obfuscation/Virtualization.cpp
   Obfuscation/AntiHooking.cpp
+  Obfuscation/TimeExpiry.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm
