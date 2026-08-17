@@ -1,0 +1,107 @@
+# =====================================================================
+# OLLVM17 Flag Verification — Manual Test Workflow
+# 
+# Run this AFTER the main build completes successfully.
+# Tests all 15 flags + 4 tiers using the built clang from artifact.
+# =====================================================================
+name: Verify OLLVM17 Flags
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: 'Artifact to download (from build run)'
+        required: false
+        default: 'ollvm17-17.0.6-windows-x86_64'
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download built toolchain artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.artifact_name }}
+          path: ollvm-dist
+
+      - name: Show clang version
+        shell: pwsh
+        run: |
+          $clang = "$env:GITHUB_WORKSPACE\ollvm-dist\bin\clang.exe"
+          if (-not (Test-Path $clang)) {
+            Write-Host "ERROR: clang.exe not found. Did the build pass?"
+            Get-ChildItem "$env:GITHUB_WORKSPACE\ollvm-dist" -Recurse -Name
+            exit 1
+          }
+          & $clang --version
+
+      - name: Create test file
+        shell: pwsh
+        run: |
+          @"
+          static const char* msg = "ollvm17-verify";
+          int test_func(int a, int b) {
+              int x = a + b;
+              int y = x * 2;
+              int z = y - a;
+              return z ^ (int)msg[0];
+          }
+          int main() { return test_func(1, 2); }
+          "@ | Set-Content "$env:TEMP\ollvm_test.c" -Force
+
+      - name: Test Flags (15 individual)
+        shell: pwsh
+        run: |
+          $clang = "$env:GITHUB_WORKSPACE\ollvm-dist\bin\clang.exe"
+          $tf = "$env:TEMP\ollvm_test.c"
+          $pass = 0; $fail = 0
+          
+          $flags = @("sub","sobf","mba","alias","bcf","bcf2","split","fla","icall","ibr","igv","junkcode","mergefunc","fncmd","aarch64-obfu","antidbg","funcwrap")
+          
+          Write-Host "=== Individual Flag Test ==="
+          foreach ($f in $flags) {
+            $out = & $clang --target=aarch64-linux-android26 -O2 -c $tf -o "$env:TEMP\t_$f.o" -mllvm -$f 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "  [PASS] -mllvm -$f" -ForegroundColor Green
+              $pass++
+            } else {
+              Write-Host "  [FAIL] -mllvm -$f" -ForegroundColor Red
+              $fail++
+              $err = ($out | Select-String "error:" | Select -First 1).Line
+              if ($err) { Write-Host "         $err" -ForegroundColor Red }
+            }
+          }
+          
+          Write-Host ""
+          Write-Host "Individual: $pass / $($flags.Count) working" -ForegroundColor $(if($fail -eq 0){'Green'}else{'Red'})
+
+      - name: Test Tiers (4 combinations)
+        shell: pwsh
+        run: |
+          $clang = "$env:GITHUB_WORKSPACE\ollvm-dist\bin\clang.exe"
+          $tf = "$env:TEMP\ollvm_test.c"
+          $baseargs = "--target=aarch64-linux-android26 -O2 -c `"$tf`""
+          
+          $low  = "-mllvm -sub -mllvm -sub_loop=3 -mllvm -sobf -mllvm -mba -mllvm -alias"
+          $med  = "$low -mllvm -bcf -mllvm -bcf_prob=60 -mllvm -bcf_loop=1 -mllvm -split -mllvm -split_num=5 -mllvm -junkcode -mllvm -icall -mllvm -ibr"
+          $max  = "$med -mllvm -bcf2 -mllvm -mergefunc -mllvm -igv -mllvm -antidbg -mllvm -funcwrap"
+          $all  = "$max -mllvm -fla -mllvm -aarch64-obfu -mllvm -fncmd"
+          
+          Write-Host "=== Tier Combination Test ==="
+          
+          cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_low.o`" $low 2>&1" | Out-Null
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] LOW     [4 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] LOW" -ForegroundColor Red}
+          
+          cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_med.o`" $med 2>&1" | Out-Null
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MEDIUM  [9 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MEDIUM" -ForegroundColor Red}
+          
+          cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_max.o`" $max 2>&1" | Out-Null
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MAX     [14 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MAX" -ForegroundColor Red}
+          
+          cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_all.o`" $all 2>&1" | Out-Null
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] ALL     [17 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] ALL" -ForegroundColor Red}
