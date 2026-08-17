@@ -120,7 +120,18 @@ PreservedAnalyses AntiHooking::run(Module &M, ModuleAnalysisManager &AM) {
                                 GlobalValue::PrivateLinkage, Called,
                                 SymbolName);
         GV->setConstant(true);
-        appendToCompilerUsed(M, {GV});
+        // Mark as compiler-used to prevent optimization
+        llvm::SmallVector<llvm::Metadata *> UsedVals;
+        auto *Cast = llvm::ConstantAsMetadata::get(llvm::ConstantExpr::getBitCast(GV, llvm::Type::getInt8PtrTy(M.getContext())));
+        UsedVals.push_back(Cast);
+        if (auto *ExistingUsed = M.getNamedMetadata("llvm.compiler.used")) {
+          for (auto *Op : ExistingUsed->operands())
+            UsedVals.push_back(Op);
+        }
+        llvm::NamedMDNode *NMD = M.getOrInsertNamedMetadata("llvm.compiler.used");
+        NMD->clearOperands();
+        for (auto *MD : UsedVals)
+          NMD->addOperand(llvm::MDNode::get(M.getContext(), MD));
       }
       LoadInst *Load = new LoadInst(GV->getValueType(), GV, Called->getName(), CB);
       CB->setCalledOperand(Load);
