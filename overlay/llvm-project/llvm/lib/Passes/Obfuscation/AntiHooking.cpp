@@ -1,5 +1,10 @@
+// AntiHooking pass — inline-hook detection (AArch64) + anti-rebind.
+// Ported from Hikari's AntiHooking.cpp, converted to the new pass manager
+// and stripped of the precompiled-`.bc` handler mechanism (the handler is
+// now inlined as abort()/AHCallBack()).
 #include "Obfuscation/AntiHooking.h"
 #include "Obfuscation/Utils.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -8,166 +13,72 @@
 
 using namespace llvm;
 
-// AArch64 instruction signatures used to detect inline hooks.
-// A hook inserts a branch/break at the function entry to redirect execution.
-#define AARCH64_SIG_B   0x05u  // top 6 bits of an unconditional B  instruction
-#define AARCH64_SIG_BRK 0x6A1u // top 11 bits of a BRK (breakpoint) instruction
-#define AARCH64_SIG_BR  0x3587C0u // top 22 bits of a BR  Xn instruction
+// Arm A64 instruction-set signatures used to detect a trampolined prologue.
+#define AARCH64_SIGNATURE_B   0b0000101                  // B (uncond. branch)
+#define AARCH64_SIGNATURE_BR  0b11010110000111110000000 // BR/ret
+#define AARCH64_SIGNATURE_BRK 0b11010100001             // BRK
 
-// Reads a 32-bit instruction word from base + byteOffset, returns as i32.
-static Value *readInsnWord(IRBuilder<> &IRB, Value *BaseI64, int ByteOff,
-                           LLVMContext &Ctx) {
-  Type *I8PtrTy = PointerType::get(Type::getInt8Ty(Ctx), 0);
-  Type *I32Ty   = Type::getInt32Ty(Ctx);
-  // base + offset → pointer → load 32-bit instruction word
-  Value *Ptr = ByteOff == 0
-                   ? IRB.CreateIntToPtr(BaseI64, I8PtrTy)
-                   : IRB.CreateIntToPtr(
-                         IRB.CreateAdd(BaseI64,
-                                       ConstantInt::get(
-                                           Type::getInt64Ty(Ctx), ByteOff)),
-                         I8PtrTy);
-  // Bitcast to i32* then load (instruction words are 4 bytes on AArch64)
-  Value *I32Ptr = IRB.CreateBitCast(
-      Ptr, PointerType::get(I32Ty, 0));
-  return IRB.CreateLoad(I32Ty, I32Ptr);
-}
+// Replace the original prologue with a check that the first instructions have
+// not been overwritten with a branch (inline hook). On detection, jump to a
+// handler (AHCallBack() if present, else abort()).
+void AntiHooking::handleInlineHookAArch64(Function *F) {
+  LLVMContext &Ctx = F->getContext();
+  Module *M = F->getParent();
 
-// Builds the hook-detection prologue for an AArch64 function.
-// Splits the entry block and inserts three detection blocks before the
-// original code. Any detected hook calls abort() and then falls through
-// (the branch to the original code is unreachable in practice).
-static void insertAArch64HookCheck(Function &F) {
-  LLVMContext &Ctx = F.getContext();
-  Module *M = F.getParent();
+  BasicBlock *A = &F->getEntryBlock();
+  BasicBlock *C = A->splitBasicBlock(A->getFirstNonPHIOrDbgOrLifetime());
+  BasicBlock *B = BasicBlock::Create(Ctx, "HookDetectedHandler", F);
+  BasicBlock *Detect = BasicBlock::Create(Ctx, "", F);
+  BasicBlock *Detect2 = BasicBlock::Create(Ctx, "", F);
 
-  // Declare abort() if not already present.
-  FunctionType *AbortTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-  FunctionCallee AbortFn = M->getOrInsertFunction("abort", AbortTy);
-  cast<Function>(AbortFn.getCallee())->addFnAttr(Attribute::NoReturn);
+  A->getTerminator()->eraseFromParent();
+  BranchInst::Create(Detect, A);
 
   Type *I32Ty = Type::getInt32Ty(Ctx);
   Type *I64Ty = Type::getInt64Ty(Ctx);
 
-  // Split the entry block: everything from the first non-PHI/dbg instruction
-  // onward moves into 'OrigBB'. We insert detection blocks before it.
-  BasicBlock *OrigBB = &F.getEntryBlock();
-  BasicBlock *CheckBB =
-      OrigBB->splitBasicBlock(OrigBB->getFirstNonPHIOrDbg(), "ah.check");
+  // Detect: read the first instruction word of F.
+  IRBuilder<> IRBD(Detect);
+  Value *Load = IRBD.CreateLoad(I32Ty, F);
+  Value *LS2 = IRBD.CreateLShr(Load, IRBD.getInt32(26));
+  Value *ICmpB = IRBD.CreateICmpEQ(LS2, IRBD.getInt32(AARCH64_SIGNATURE_B));
+  Value *LS3 = IRBD.CreateLShr(Load, IRBD.getInt32(21));
+  Value *ICmpBRK = IRBD.CreateICmpEQ(LS3, IRBD.getInt32(AARCH64_SIGNATURE_BRK));
+  IRBD.CreateCondBr(IRBD.CreateOr(ICmpB, ICmpBRK), B, Detect2);
 
-  // Remove the unconditional branch the split inserted; we'll add our own.
-  OrigBB->getTerminator()->eraseFromParent();
+  // Detect2: check instruction words at F+4 and F+8 for BR (branch to reg).
+  IRBuilder<> IRBD2(Detect2);
+  Value *PTI = IRBD2.CreatePtrToInt(F, I64Ty);
+  Value *Add4 = IRBD2.CreateAdd(PTI, IRBD2.getInt64(4));
+  Value *Load2 = IRBD2.CreateLoad(I32Ty, IRBD2.CreateIntToPtr(Add4, PointerType::get(Ctx, 0)));
+  Value *LS4 = IRBD2.CreateLShr(Load2, IRBD2.getInt32(10));
+  Value *ICmpBR1 = IRBD2.CreateICmpEQ(LS4, IRBD2.getInt32(AARCH64_SIGNATURE_BR));
 
-  // 'HookBB' — executed when a hook is detected: call abort().
-  BasicBlock *HookBB = BasicBlock::Create(Ctx, "ah.hooked", &F, CheckBB);
-  {
-    IRBuilder<> B(HookBB);
-    B.CreateCall(AbortFn);
-    B.CreateBr(CheckBB); // unreachable, but satisfies IR well-formedness
+  Value *Add8 = IRBD2.CreateAdd(PTI, IRBD2.getInt64(8));
+  Value *Load3 = IRBD2.CreateLoad(I32Ty, IRBD2.CreateIntToPtr(Add8, PointerType::get(Ctx, 0)));
+  Value *LS5 = IRBD2.CreateLShr(Load3, IRBD2.getInt32(10));
+  Value *ICmpBR2 = IRBD2.CreateICmpEQ(LS5, IRBD2.getInt32(AARCH64_SIGNATURE_BR));
+
+  IRBD2.CreateCondBr(IRBD2.CreateOr(ICmpBR1, ICmpBR2), B, C);
+
+  // B: call the hook handler, then continue into the real body C.
+  IRBuilder<> IRBB(B);
+  Function *AHCallBack = M->getFunction("AHCallBack");
+  if (AHCallBack) {
+    IRBB.CreateCall(AHCallBack);
+  } else {
+    Function *abortFn = cast<Function>(
+        M->getOrInsertFunction("abort", FunctionType::get(IRBB.getVoidTy(), false))
+            .getCallee());
+    abortFn->addFnAttr(Attribute::NoReturn);
+    IRBB.CreateCall(abortFn);
   }
-
-  // 'DetectBB' — check instruction 0 (B / BRK) and instruction 1+2 (BR stub).
-  BasicBlock *DetectBB =
-      BasicBlock::Create(Ctx, "ah.detect", &F, HookBB);
-
-  IRBuilder<> DB(OrigBB); // insert at end of original entry (now empty of user code)
-
-  // Get the function's own address as an integer.
-  Value *FnPtr  = ConstantExpr::getPtrToInt(
-      cast<Constant>(
-          ConstantExpr::getBitCast(&F,
-              PointerType::get(Type::getInt8Ty(Ctx), 0))),
-      I64Ty);
-
-  // Read instruction word 0.
-  IRBuilder<> IRB(DetectBB);
-  Value *Insn0 = readInsnWord(IRB, FnPtr, 0, Ctx);
-
-  // Check for B: top 6 bits == AARCH64_SIG_B
-  Value *Shift26 = IRB.CreateLShr(Insn0, ConstantInt::get(I32Ty, 26));
-  Value *IsB     = IRB.CreateICmpEQ(Shift26,
-                       ConstantInt::get(I32Ty, AARCH64_SIG_B));
-
-  // Check for BRK: top 11 bits == AARCH64_SIG_BRK
-  Value *Shift21  = IRB.CreateLShr(Insn0, ConstantInt::get(I32Ty, 21));
-  Value *IsBrk    = IRB.CreateICmpEQ(Shift21,
-                        ConstantInt::get(I32Ty, AARCH64_SIG_BRK));
-
-  Value *IsHook0  = IRB.CreateOr(IsB, IsBrk);
-
-  // 'Detect2BB' — check instructions 1 and 2 for LDR+BR Xn stub.
-  BasicBlock *Detect2BB =
-      BasicBlock::Create(Ctx, "ah.detect2", &F, HookBB);
-
-  IRB.CreateCondBr(IsHook0, HookBB, Detect2BB);
-
-  IRBuilder<> IRB2(Detect2BB);
-  Value *Insn1   = readInsnWord(IRB2, FnPtr, 4, Ctx);
-  Value *Insn2   = readInsnWord(IRB2, FnPtr, 8, Ctx);
-  Value *Shr10_1 = IRB2.CreateLShr(Insn1, ConstantInt::get(I32Ty, 10));
-  Value *Shr10_2 = IRB2.CreateLShr(Insn2, ConstantInt::get(I32Ty, 10));
-  Value *IsBR1   = IRB2.CreateICmpEQ(Shr10_1,
-                       ConstantInt::get(I32Ty, AARCH64_SIG_BR));
-  Value *IsBR2   = IRB2.CreateICmpEQ(Shr10_2,
-                       ConstantInt::get(I32Ty, AARCH64_SIG_BR));
-  Value *IsHook1 = IRB2.CreateOr(IsBR1, IsBR2);
-  IRB2.CreateCondBr(IsHook1, HookBB, CheckBB);
-
-  // Wire the original entry block into the detection chain.
-  DB.CreateBr(DetectBB);
-}
-
-// Wraps every external callee referenced in F in a private const GlobalVariable
-// so fishhook-style runtime symbol rebinding cannot redirect the call.
-static void insertAntiRebind(Function &F) {
-  Module *M = F.getParent();
-  LLVMContext &Ctx = F.getContext();
-
-  std::vector<CallInst *> Calls;
-  for (BasicBlock &BB : F)
-    for (Instruction &I : BB)
-      if (CallInst *CI = dyn_cast<CallInst>(&I))
-        Calls.push_back(CI);
-
-  for (CallInst *CI : Calls) {
-    Function *Callee = CI->getCalledFunction();
-    if (!Callee || !Callee->isDeclaration() || Callee->isIntrinsic())
-      continue;
-
-    // Create a private const global holding the function pointer.
-    // The linker cannot rebind a private symbol, so fishhook cannot
-    // intercept the call.
-    std::string GVName = "__ah_rb_" + Callee->getName().str();
-    GlobalVariable *GV = M->getGlobalVariable(GVName);
-    if (!GV) {
-      Type *FPtrTy = PointerType::get(Type::getInt8Ty(Ctx), 0);
-      Constant *FPtrConst = ConstantExpr::getBitCast(Callee, FPtrTy);
-      GV = new GlobalVariable(*M, FPtrTy,
-                              /*isConstant=*/true,
-                              GlobalValue::PrivateLinkage,
-                              FPtrConst, GVName);
-      // Prevent the optimizer from stripping the global.
-      appendToCompilerUsed(*M, {GV});
-    }
-
-    // Load the function pointer from the private global and call through it.
-    IRBuilder<> IRB(CI);
-    Value *FpLoad = IRB.CreateLoad(
-        PointerType::get(Type::getInt8Ty(Ctx), 0), GV);
-    CallInst *NewCall = IRB.CreateCall(
-        CI->getFunctionType(), FpLoad,
-        SmallVector<Value *, 8>(CI->arg_begin(), CI->arg_end()));
-    NewCall->setCallingConv(CI->getCallingConv());
-    if (!CI->getType()->isVoidTy())
-      CI->replaceAllUsesWith(NewCall);
-    CI->eraseFromParent();
-  }
+  IRBB.CreateBr(C);
 }
 
 PreservedAnalyses AntiHooking::run(Module &M, ModuleAnalysisManager &AM) {
   bool Changed = false;
-  Triple T(M.getTargetTriple());
-  bool IsAArch64 = T.isAArch64();
+  bool IsAArch64 = Triple(M.getTargetTriple()).isAArch64();
 
   for (Function &F : M) {
     if (F.isDeclaration() || F.empty())
@@ -176,14 +87,44 @@ PreservedAnalyses AntiHooking::run(Module &M, ModuleAnalysisManager &AM) {
         getFunctionAnnotation(&F).find("antihook") == std::string::npos)
       continue;
 
-    // Protection 1: AArch64 inline hook detection at function entry.
-    if (IsAArch64)
-      insertAArch64HookCheck(F);
+    if (IsAArch64) {
+      handleInlineHookAArch64(&F);
+      Changed = true;
+    }
 
-    // Protection 2: wrap callees in private globals to defeat rebinding.
-    insertAntiRebind(F);
+    // Anti-rebind: route calls to external declarations through a private
+    // constant global holding the function pointer, so fishhook can't rebind.
+    std::vector<CallBase *> ToRedirect;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          Function *Called = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+          if (!Called || !Called->isDeclaration() ||
+              !Called->hasExternalLinkage() || Called->isIntrinsic())
+            continue;
+          StringRef Name = Called->getName();
+          if (Name.starts_with("clang.") || Name.starts_with("llvm.") ||
+              Name == "dlopen" || Name == "dlsym" || Name == "dlclose")
+            continue;
+          ToRedirect.push_back(CB);
+        }
+      }
+    }
 
-    Changed = true;
+    for (CallBase *CB : ToRedirect) {
+      Function *Called = cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+      GlobalVariable *GV = M.getGlobalVariable("AntiRebindSymbol_" + Called->getName());
+      if (!GV) {
+        GV = new GlobalVariable(M, Called->getType(), false,
+                                GlobalValue::PrivateLinkage, Called,
+                                "AntiRebindSymbol_" + Called->getName());
+        GV->setConstant(true);
+        appendToCompilerUsed(M, {GV});
+      }
+      LoadInst *Load = new LoadInst(GV->getValueType(), GV, Called->getName(), CB);
+      CB->setCalledOperand(Load);
+      Changed = true;
+    }
   }
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

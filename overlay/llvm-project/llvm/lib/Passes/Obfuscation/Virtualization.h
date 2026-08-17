@@ -12,8 +12,9 @@ using namespace llvm;
 //
 // Supported IR constructs: alloca, load, store, binary ops, icmp,
 // branch, ret, cast, select, gep (simple forms), call.
-// Unsupported: phi nodes (run mem2reg first), atomics, varargs, invoke,
-// vector/float types. Unsupported functions are skipped cleanly.
+// PHI nodes are demoted to stack automatically (fixStack) before translation.
+// Unsupported: atomics, varargs, invoke, indirect calls, vector/float types.
+// Unsupported functions are skipped cleanly.
 //
 // Usage:
 //   global:      -mllvm -vmp

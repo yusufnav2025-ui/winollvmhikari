@@ -1,8 +1,8 @@
 # =====================================================================
 # OLLVM17 Flag Verification — Manual Test Workflow
-# 
+#
 # Run this AFTER the main build completes successfully.
-# Tests all 15 flags + 4 tiers using the built clang from artifact.
+# Tests all 21 flags + 4 tiers using the built clang from artifact.
 # =====================================================================
 name: Verify OLLVM17 Flags
 
@@ -54,14 +54,14 @@ jobs:
           int main() { return test_func(1, 2); }
           "@ | Set-Content "$env:TEMP\ollvm_test.c" -Force
 
-      - name: Test Flags (15 individual)
+      - name: Test Flags (21 individual)
         shell: pwsh
         run: |
           $clang = "$env:GITHUB_WORKSPACE\ollvm-dist\bin\clang.exe"
           $tf = "$env:TEMP\ollvm_test.c"
           $pass = 0; $fail = 0
           
-          $flags = @("sub","sobf","mba","alias","bcf","bcf2","split","fla","icall","ibr","igv","junkcode","mergefunc","fncmd","aarch64-obfu","antidbg","funcwrap")
+          $flags = @("sub","sobf","mba","alias","bcf","bcf2","split","fla","icall","ibr","igv","junkcode","mergefunc","fncmd","aarch64-obfu","antidbg","funcwrap","constenc","fco","antihook","vmp")
           
           Write-Host "=== Individual Flag Test ==="
           foreach ($f in $flags) {
@@ -88,20 +88,20 @@ jobs:
           $baseargs = "--target=aarch64-linux-android26 -O2 -c `"$tf`""
           
           $low  = "-mllvm -sub -mllvm -sub_loop=3 -mllvm -sobf -mllvm -mba -mllvm -alias"
-          $med  = "$low -mllvm -bcf -mllvm -bcf_prob=60 -mllvm -bcf_loop=1 -mllvm -split -mllvm -split_num=5 -mllvm -junkcode -mllvm -icall -mllvm -ibr"
-          $max  = "$med -mllvm -bcf2 -mllvm -mergefunc -mllvm -igv -mllvm -antidbg -mllvm -funcwrap"
+          $med  = "$low -mllvm -bcf -mllvm -bcf_prob=60 -mllvm -bcf_loop=1 -mllvm -split -mllvm -split_num=5 -mllvm -junkcode -mllvm -icall -mllvm -ibr -mllvm -constenc -mllvm -fco"
+          $max  = "$med -mllvm -bcf2 -mllvm -mergefunc -mllvm -igv -mllvm -antidbg -mllvm -funcwrap -mllvm -antihook -mllvm -vmp"
           $all  = "$max -mllvm -fla -mllvm -aarch64-obfu -mllvm -fncmd"
           
           Write-Host "=== Tier Combination Test ==="
           
           cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_low.o`" $low 2>&1" | Out-Null
           if($LASTEXITCODE -eq 0){Write-Host "  [PASS] LOW     [4 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] LOW" -ForegroundColor Red}
-          
+
           cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_med.o`" $med 2>&1" | Out-Null
-          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MEDIUM  [9 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MEDIUM" -ForegroundColor Red}
-          
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MEDIUM  [11 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MEDIUM" -ForegroundColor Red}
+
           cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_max.o`" $max 2>&1" | Out-Null
-          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MAX     [14 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MAX" -ForegroundColor Red}
-          
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] MAX     [18 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] MAX" -ForegroundColor Red}
+
           cmd /c "`"$clang`" $baseargs -o `"$env:TEMP\tier_all.o`" $all 2>&1" | Out-Null
-          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] ALL     [17 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] ALL" -ForegroundColor Red}
+          if($LASTEXITCODE -eq 0){Write-Host "  [PASS] ALL     [21 passes]" -ForegroundColor Green}else{Write-Host "  [FAIL] ALL" -ForegroundColor Red}

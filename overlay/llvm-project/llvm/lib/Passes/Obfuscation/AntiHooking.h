@@ -3,21 +3,8 @@
 
 using namespace llvm;
 
-// AntiHooking — detects inline hooks and prevents symbol rebinding at runtime.
-//
-// Two independent protections (both on by default when the pass is enabled):
-//
-//   1. Inline hook detection (AArch64 only):
-//      Inserts IR at function entry that reads the first 3 instructions of
-//      the function's own machine code and checks for hook signatures:
-//        - B  (unconditional branch)   — classic trampoline pattern
-//        - BRK (breakpoint)             — debugger injection
-//        - LDR + BR Xn                  — Substrate/fishhook stub
-//      If detected → calls abort().
-//
-//   2. Anti-rebind (all targets):
-//      Wraps every external callee pointer in a private const GlobalVariable
-//      so fishhook-style symbol rebinding at runtime cannot redirect the call.
+// AntiHooking — inline-hook detection (AArch64) + anti-rebind (fishhook).
+// Ported from Hikari, converted to the new pass manager.
 //
 // Usage:
 //   global:      -mllvm -antihook
@@ -26,5 +13,6 @@ struct AntiHooking : PassInfoMixin<AntiHooking> {
   bool enabled;
   AntiHooking(bool enabled = false) : enabled(enabled) {}
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+  void handleInlineHookAArch64(Function *F);
   static bool isRequired() { return true; }
 };

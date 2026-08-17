@@ -176,6 +176,16 @@ bool llvm::toObfuscate(bool flag, Function *f,
  *
  * @param F
  */
+static bool valueEscapes(llvm::Instruction &I) {
+  llvm::BasicBlock *BB = I.getParent();
+  for (llvm::User *U : I.users()) {
+    llvm::Instruction *UI = llvm::dyn_cast<llvm::Instruction>(U);
+    if (!UI || UI->getParent() != BB)
+      return true;
+  }
+  return false;
+}
+
 void llvm::fixStack(Function &F) {
   // Insert all new allocas into entry block.
   BasicBlock *BBEntry = &F.getEntryBlock();
