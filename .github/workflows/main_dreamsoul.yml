@@ -525,7 +525,7 @@ jobs:
             -DCMAKE_C_FLAGS="/utf-8" \
             -DCMAKE_CXX_FLAGS="/utf-8" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;ARM;X86" \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_ASSERTIONS=OFF \
             -DLLVM_ENABLE_EH=OFF \
             -DLLVM_ENABLE_RTTI=OFF \
@@ -536,7 +536,7 @@ jobs:
             -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
             -DLLVM_ENABLE_PLUGINS=OFF \
-            -DLLVM_PARALLEL_COMPILE_JOBS=2 \
+            -DLLVM_PARALLEL_COMPILE_JOBS=4 \
             -DLLVM_PARALLEL_LINK_JOBS=1
 
       # ---------------------------------------------------------------
@@ -546,7 +546,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          N="${NUMBER_OF_PROCESSORS:-2}"
+          # Use 4 parallel Ninja jobs to maximize throughput
+          N=4
           echo "Building with $N parallel jobs..."
           cmake --build build --target install --parallel "$N"
           echo "---- Installed toolchain ----"
