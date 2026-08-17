@@ -536,77 +536,19 @@ jobs:
             -DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
             -DLLVM_OPTIMIZED_TABLEGEN=ON \
             -DLLVM_ENABLE_PLUGINS=OFF \
-            -DLLVM_PARALLEL_COMPILE_JOBS=1 \
+            -DLLVM_PARALLEL_COMPILE_JOBS=2 \
             -DLLVM_PARALLEL_LINK_JOBS=1
 
       # ---------------------------------------------------------------
       # 8. Build & install (only the toolchain: clang, lld, headers)
-      #    Add memory monitoring and automatic parallelism reduction on OOM
       # ---------------------------------------------------------------
       - name: Build & install toolchain
         shell: bash
         run: |
           set -euo pipefail
-
-          # Start with conservative parallelism (GitHub Actions has ~16GB RAM)
-          N=2
-
-          echo "=========================================="
-          echo "Build attempt with -j$N parallelism"
-          echo "LLVM_PARALLEL_COMPILE_JOBS=2 (set in CMake)"
-          echo "LLVM_PARALLEL_LINK_JOBS=1 (set in CMake)"
-          echo "=========================================="
-
-          # Attempt build with error detection
-          if ! cmake --build build --target install --parallel "$N" 2>&1 | tee build.log; then
-            echo ""
-            echo "=========================================="
-            echo "BUILD FAILED - Analyzing error..."
-            echo "=========================================="
-
-            # Check for common memory-related failures
-            if grep -qi "killed\|out of memory\|cannot allocate\|heap space\|fatal error.*memory" build.log; then
-              echo ""
-              echo "ERROR: Out of Memory detected!"
-              echo "The build requires more RAM than available on GitHub Actions runners."
-              echo ""
-              echo "SOLUTIONS:"
-              echo "1. Reduce LLVM_PARALLEL_COMPILE_JOBS to 1 in CMakeLists (line 539)"
-              echo "2. Disable some obfuscation passes to reduce compile load"
-              echo "3. Build locally with more RAM (recommended: 32GB+)"
-              echo "4. Use pre-built OLLVM binaries"
-              echo ""
-              echo "Current limits: PARALLEL_COMPILE_JOBS=2, PARALLEL_LINK_JOBS=1, Ninja -j2"
-              echo "Pagefile: 16-32GB on D: drive"
-              echo ""
-              exit 1
-            fi
-
-            # Check for timeout
-            if grep -qi "timeout\|time limit exceeded" build.log; then
-              echo ""
-              echo "ERROR: Build timeout (6 hours exceeded)!"
-              echo "The build is too large for GitHub Actions free tier."
-              echo ""
-              echo "SOLUTIONS:"
-              echo "1. Build locally (faster with more cores)"
-              echo "2. Disable some passes to reduce build time"
-              echo "3. Use pre-built binaries"
-              echo ""
-              exit 1
-            fi
-
-            # Generic failure - show last 50 lines
-            echo ""
-            echo "Unknown build failure. Last 50 lines of output:"
-            echo "=========================================="
-            tail -50 build.log
-            exit 1
-          fi
-
-          echo ""
-          echo "=========================================="
-          echo "BUILD SUCCESSFUL"
+          N="${NUMBER_OF_PROCESSORS:-2}"
+          echo "Building with $N parallel jobs..."
+          cmake --build build --target install --parallel "$N"
           echo "---- Installed toolchain ----"
           ls -R "$GITHUB_WORKSPACE/ollvm-dist/bin" | head -50
 
